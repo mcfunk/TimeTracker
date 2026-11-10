@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""tt - a small time tracker for work orders and the steps within each order.
+
+Run `tt --help` for the command list. Data lives in ~/.local/share/tt/tt.db.
+"""
+
+import argparse
+import csv
+import os
+import re
+import sqlite3
+import sys
+from datetime import date, datetime, timedelta
+
+# =============================================================================
+# CONFIG - edit the settings below to fit your workflow
+# =============================================================================
+
+# ----- 1. STEPS --------------------------------------------------------------
+
+# The steps an order goes through, in order. New orders begin at the first one.
+# On the command line a step can be given by name, by any unique prefix
+# ("as" -> "assemble"), or by number (1 = first step).
+STEPS = ["pick", "assemble", "test", "pack"]
+
+# ----- 2. ORDER ID VALIDATION ------------------------------------------------
+
+# Pattern a NEW order ID must match in full (checked after normalizing).
+# Default: permissive - any 1 to 40 non-whitespace characters.
+ORDER_ID_REGEX = r"\S{1,40}"
+# Stricter alternatives - comment out the line above and uncomment one of:
+# ORDER_ID_REGEX = r"\d{8}"                  # exactly 8 digits
+# ORDER_ID_REGEX = r"\d+(-\d+)*"             # digits with optional dashes
+# ORDER_ID_REGEX = r"[A-Za-z0-9_/#.\-]+"     # letters, digits and - _ / # .
+
+# How an order ID is cleaned up before it is validated, stored or matched:
+#   "none"        - use exactly what was typed
+#   "strip"       - remove leading/trailing whitespace
+#   "strip_upper" - remove whitespace and convert to UPPERCASE
+ORDER_ID_NORMALIZE = "strip"
+
+# ----- 3. CSV EXPORT ---------------------------------------------------------
+
+# Columns to export, in order. Choose from:
+#   order_id, step, date, start, end, duration, paused_time, order_status, note
+CSV_COLUMNS = ["order_id", "step", "date", "start", "end", "duration", "note"]
+
+# Header text for each field, so the file matches another system's column
+# names. Fields missing from this mapping use the field name itself.
+CSV_HEADERS = {
+    "order_id": "Order",
+    "step": "Step",
+    "date": "Date",
+    "start": "Start",
+    "end": "End",
+    "duration": "Hours",
+    "paused_time": "Paused",
+    "order_status": "Status",
+    "note": "Note",
+}
+
+# What one CSV row represents:
+#   "entry" - one row per time entry
+#   "step"  - one row per order and step (times summed)
+#   "order" - one row per order (times summed, steps listed together)
+CSV_ROW_MODE = "entry"
+
+# How duration and paused_time are written:
+#   "decimal_hours" - 1.25
+#   "minutes"       - 75
+#   "h:mm"          - 1:15
+CSV_DURATION_FORMAT = "decimal_hours"
+
+# Round each exported duration to the nearest N minutes, once per row, after
+# summing. 15 = nearest quarter hour, 6 = nearest 0.1 hour, 1 = nearest
+# minute, 0 = no rounding.
+CSV_ROUND_MINUTES = 1
+
+# strftime format for the date column.
+CSV_DATE_FORMAT = "%Y-%m-%d"
+
+# strftime format for the start and end columns.
+CSV_TIME_FORMAT = "%H:%M"
+
+# Field separator: "," for standard CSV, ";" or "\t" if your system needs it.
+CSV_DELIMITER = ","
+
+# Write the header row (True) or data rows only (False).
+CSV_INCLUDE_HEADER = True
+
+# =============================================================================
+# END OF CONFIG
+# =============================================================================
+
+# Database location. The TT_DB environment variable overrides it, which is
+# handy for trying things out without touching real data.
+DB_PATH = os.environ.get("TT_DB") or os.path.expanduser("~/.local/share/tt/tt.db")
+
+CSV_FIELDS = ("order_id", "step", "date", "start", "end", "duration",
+              "paused_time", "order_status", "note")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS orders (
+    id           INTEGER PRIMARY KEY,
+    order_id     TEXT UNIQUE NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open',
+    current_step TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    closed_at    TEXT,
+    touched_at   TEXT NOT NULL,
+    touched_seq  INTEGER NOT NULL DEFAULT 0   -- increases on every touch
+);
+CREATE TABLE IF NOT EXISTS entries (
+    id               INTEGER PRIMARY KEY,
+    order_pk         INTEGER NOT NULL REFERENCES orders(id),
+    step             TEXT NOT NULL,
+    start_ts         TEXT NOT NULL,
+    end_ts           TEXT,
+    paused_secs      INTEGER NOT NULL DEFAULT 0,
+    pause_started_at TEXT,
+    step_completed   INTEGER NOT NULL DEFAULT 0,
+    note             TEXT
+);
+CREATE INDEX IF NOT EXISTS entries_order ON entries(order_pk);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
+"""
+
+
+class TTError(Exception):
+    """A user-facing error: printed as one line, exit status 1."""
+
+
+# ----- time helpers ----------------------------------------------------------
+
+def now():
+    return datetime.now().replace(microsecond=0)
+
+
+def ts(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_ts(text):
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+
+
+def entry_paused_seconds(entry, t):
+    """Total paused seconds of an entry, including a pause still in progress."""
+    paused = entry["paused_secs"]
+    if entry["end_ts"] is None and entry["pause_started_at"]:
+        paused += max(0, int((t - parse_ts(entry["pause_started_at"])).total_seconds()))
+    return paused
+
+
+def entry_seconds(entry, t):
+    """Worked seconds of an entry: start to end (or now), minus paused time."""
+    end = parse_ts(entry["end_ts"]) if entry["end_ts"] else t
+    span = int((end - parse_ts(entry["start_ts"])).total_seconds())
+    return max(0, span - entry_paused_seconds(entry, t))
+
+
+def fmt_hmm(seconds):
+    """Seconds as H:MM for terminal output (whole minutes, rounded down)."""
+    minutes = int(seconds) // 60
+    return f"{minutes // 60}:{minutes % 60:02d}"
+
+
+def round_seconds(seconds, round_minutes):
+    """Round to the nearest multiple of round_minutes (halves round up)."""
+    if not round_minutes or round_minutes <= 0:
+        return seconds
+    unit = round_minutes * 60
+    return int((seconds + unit / 2) // unit) * unit
+
+
+def format_duration(seconds, fmt=None, round_minutes=None):
+    """Format a duration for CSV export according to the CONFIG settings."""
+    fmt = CSV_DURATION_FORMAT if fmt is None else fmt
+    round_minutes = CSV_ROUND_MINUTES if round_minutes is None else round_minutes
+    seconds = round_seconds(seconds, round_minutes)
+    if fmt == "decimal_hours":
+        return f"{seconds / 3600:.2f}"
+    if fmt == "minutes":
+        text = f"{seconds / 60:.2f}"
+        return text.rstrip("0").rstrip(".")
+    if fmt == "h:mm":
+        minutes = int((seconds + 30) // 60)
+        return f"{minutes // 60}:{minutes % 60:02d}"
+    raise TTError(f"CONFIG: unknown CSV_DURATION_FORMAT '{fmt}' "
+                  "(use decimal_hours, minutes or h:mm)")
+
+
+# ----- steps and order IDs ---------------------------------------------------
+
+def resolve_step(arg):
+    """Turn a step name, unique prefix or 1-based number into a step name."""
+    text = arg.strip().lower()
+    listing = ", ".join(f"{i}={s}" for i, s in enumerate(STEPS, 1))
+    if text.isdigit():
+        number = int(text)
+        if 1 <= number <= len(STEPS):
+            return STEPS[number - 1]
+        raise TTError(f"unknown step number {number}; steps are: {listing}")
+    for step in STEPS:
+        if step.lower() == text:
+            return step
+    matches = [s for s in STEPS if s.lower().startswith(text)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise TTError(f"step '{arg}' is ambiguous; candidates: {', '.join(matches)}")
+    raise TTError(f"unknown step '{arg}'; steps are: {listing}")
+
+
+def normalize_order_id(raw):
+    if ORDER_ID_NORMALIZE == "none":
+        return raw
+    if ORDER_ID_NORMALIZE == "strip":
+        return raw.strip()
+    if ORDER_ID_NORMALIZE == "strip_upper":
+        return raw.strip().upper()
+    raise TTError(f"CONFIG: unknown ORDER_ID_NORMALIZE '{ORDER_ID_NORMALIZE}' "
+                  "(use none, strip or strip_upper)")
+
+
+def validate_order_id(order_id):
+    if not re.fullmatch(ORDER_ID_REGEX, order_id):
+        raise TTError(f"invalid order ID '{order_id}': "
+                      f"does not match pattern {ORDER_ID_REGEX}")
+    return order_id
+
+
+def match_ids(arg, ids):
+    """IDs matching arg: an exact match wins, otherwise any prefix or suffix."""
+    if arg in ids:
+        return [arg]
+    return [i for i in ids if i.startswith(arg) or i.endswith(arg)]
+
+
+# ----- database --------------------------------------------------------------
+
+def connect(path=None):
+    path = path or DB_PATH
+    if path != ":memory:":
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def _order_by_id(conn, order_id):
+    return conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+
+
+def _ids(conn, status):
+    rows = conn.execute("SELECT order_id FROM orders WHERE status = ? ORDER BY id", (status,))
+    return [r["order_id"] for r in rows]
+
+
+def find_order(conn, arg, include_done=False):
+    """Resolve an order argument; None means the most recently touched open order."""
+    if arg is None:
+        row = conn.execute("SELECT * FROM orders WHERE status = 'open' "
+                           "ORDER BY touched_seq DESC, id DESC LIMIT 1").fetchone()
+        if row is None:
+            raise TTError("no open orders; start one with: tt start <order>")
+        return row
+    oid = normalize_order_id(arg)
+    candidates = match_ids(oid, _ids(conn, "open"))
+    if not candidates and include_done:
+        candidates = match_ids(oid, _ids(conn, "done"))
+    if len(candidates) == 1:
+        return _order_by_id(conn, candidates[0])
+    if candidates:
+        raise TTError(f"'{oid}' is ambiguous; candidates: {', '.join(candidates)}")
+    done = _order_by_id(conn, oid)
+    if done is not None:
+        raise TTError(f"order {oid} is already done (tt start {oid} reopens it)")
+    raise TTError(f"no open order matches '{oid}'")
+
+
+def touch(conn, order, t):
+    # touched_seq, not the timestamp, decides "most recent": it stays correct
+    # when two commands land in the same second or the clock is adjusted.
+    conn.execute("UPDATE orders SET touched_at = ?, touched_seq = "
+                 "(SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM orders) WHERE id = ?",
+                 (ts(t), order["id"]))
+
+
+def open_entry(conn, order):
+    return conn.execute("SELECT * FROM entries WHERE order_pk = ? AND end_ts IS NULL "
+                        "ORDER BY id DESC LIMIT 1", (order["id"],)).fetchone()
+
+
+def order_entries(conn, order):
+    return conn.execute("SELECT * FROM entries WHERE order_pk = ? ORDER BY start_ts, id",
+                        (order["id"],)).fetchall()
+
+
+def order_seconds(conn, order, t, step=None):
+    return sum(entry_seconds(e, t) for e in order_entries(conn, order)
+               if step is None or e["step"] == step)
+
+
+def _new_entry(conn, order, step, t):
+    conn.execute("INSERT INTO entries (order_pk, step, start_ts) VALUES (?, ?, ?)",
+                 (order["id"], step, ts(t)))
+
+
+def _pause_entry(conn, entry, t):
+    conn.execute("UPDATE entries SET pause_started_at = ? WHERE id = ?", (ts(t), entry["id"]))
+
+
+def _resume_entry(conn, entry, t):
+    conn.execute("UPDATE entries SET paused_secs = ?, pause_started_at = NULL WHERE id = ?",
+                 (entry_paused_seconds(entry, t), entry["id"]))
+
+
+def _close_entry(conn, entry, t, completed=False):
+    # A paused entry ends where its pause began, so the trailing pause is
+    # neither worked time nor paused time.
+    end = entry["pause_started_at"] or ts(t)
+    conn.execute("UPDATE entries SET end_ts = ?, pause_started_at = NULL, "
+                 "step_completed = MAX(step_completed, ?) WHERE id = ?",
+                 (end, 1 if completed else 0, entry["id"]))
+
+
+def _complete_current_step(conn, order, t):
+    """Close the open entry (if any) and mark the order's current step complete."""
+    entry = open_entry(conn, order)
+    if entry is not None:
+        _close_entry(conn, entry, t, completed=True)
+        return
+    conn.execute("UPDATE entries SET step_completed = 1 WHERE id = ("
+                 "SELECT id FROM entries WHERE order_pk = ? AND step = ? "
+                 "ORDER BY start_ts DESC, id DESC LIMIT 1)",
+                 (order["id"], order["current_step"]))
+
+
+def _move_step(conn, order, step, t):
+    _complete_current_step(conn, order, t)
+    conn.execute("UPDATE orders SET current_step = ? WHERE id = ?", (step, order["id"]))
+    _new_entry(conn, order, step, t)
+
+
+def entry_state(entry):
+    if entry is None:
+        return "stopped"
+    return "paused" if entry["pause_started_at"] else "running"
+
+
+# ----- commands --------------------------------------------------------------
+
+def _begin(conn, order_arg, step_arg, force_new, t):
+    """Shared by start and switch. Returns (order row, confirmation text)."""
+    step = resolve_step(step_arg) if step_arg else None
+    created = False
+    if order_arg is None:
+        if force_new:
+            raise TTError("--new needs an order ID")
+        order = find_order(conn, None)
+    else:
+        oid = normalize_order_id(order_arg)
+        order = _order_by_id(conn, oid)
+        if order is not None and force_new:
+            raise TTError(f"order {oid} already exists")
+        if order is None and not force_new:
+            candidates = match_ids(oid, _ids(conn, "open"))
+            if len(candidates) > 1:
+                raise TTError(f"'{oid}' is ambiguous; candidates: {', '.join(candidates)} "
+                              f"(to create it as a new order: tt start --new {oid})")
+            if candidates:
+                order = _order_by_id(conn, candidates[0])
+        if order is None:
+            validate_order_id(oid)
+            conn.execute("INSERT INTO orders (order_id, current_step, created_at, touched_at) "
+                         "VALUES (?, ?, ?, ?)", (oid, step or STEPS[0], ts(t), ts(t)))
+            order = _order_by_id(conn, oid)
+            created = True
+
+    reopened = order["status"] == "done"
+    if reopened:
+        conn.execute("UPDATE orders SET status = 'open', closed_at = NULL WHERE id = ?",
+                     (order["id"],))
+    entry = open_entry(conn, order)
+    if step and step != order["current_step"]:
+        previous = order["current_step"]
+        _move_step(conn, order, step, t)
+        verb = f"Moved {order['order_id']} from {previous} to {step}, timer running"
+    else:
+        step = order["current_step"]
+        if entry is None:
+            _new_entry(conn, order, step, t)
+            word = "Opened and started" if created else "Reopened and started" if reopened else "Started"
+        elif entry["pause_started_at"]:
+            _resume_entry(conn, entry, t)
+            word = "Resumed"
+        else:
+            word = "Already running:"
+        verb = f"{word} {order['order_id']} [{step}]"
+    touch(conn, order, t)
+    return order, verb
+
+
+def cmd_start(conn, args, t):
+    _, text = _begin(conn, args.order, args.step, args.new, t)
+    print(text)
+
+
+def cmd_switch(conn, args, t):
+    order, text = _begin(conn, args.order, args.step, args.new, t)
+    paused = []
+    rows = conn.execute("SELECT e.*, o.order_id FROM entries e JOIN orders o ON o.id = e.order_pk "
+                        "WHERE e.end_ts IS NULL AND e.pause_started_at IS NULL AND o.id != ? "
+                        "ORDER BY o.id", (order["id"],)).fetchall()
+    for entry in rows:
+        _pause_entry(conn, entry, t)
+        paused.append(entry["order_id"])
+    print(text + (f" (paused: {', '.join(paused)})" if paused else ""))
+
+
+def cmd_step(conn, args, t):
+    step = resolve_step(args.step)
+    order = find_order(conn, args.order)
+    previous = order["current_step"]
+    if step == previous:
+        raise TTError(f"order {order['order_id']} is already on step '{step}'")
+    spent = order_seconds(conn, order, t, previous)
+    _move_step(conn, order, step, t)
+    touch(conn, order, t)
+    print(f"Moved {order['order_id']} from {previous} ({fmt_hmm(spent)}, complete) "
+          f"to {step}, timer running")
+
+
+def _running_entries(conn, include_paused):
+    sql = ("SELECT e.*, o.order_id, o.current_step FROM entries e "
+           "JOIN orders o ON o.id = e.order_pk WHERE e.end_ts IS NULL")
+    if not include_paused:
+        sql += " AND e.pause_started_at IS NULL"
+    return conn.execute(sql + " ORDER BY o.id").fetchall()
+
+
+def cmd_pause(conn, args, t):
+    if args.all:
+        if args.order:
+            raise TTError("give an order or --all, not both")
+        rows = _running_entries(conn, include_paused=False)
+        for entry in rows:
+            _pause_entry(conn, entry, t)
+        names = ", ".join(r["order_id"] for r in rows)
+        print(f"Paused {len(rows)} timer(s): {names}" if rows else "No running timers to pause")
+        return
+    order = find_order(conn, args.order)
+    entry = open_entry(conn, order)
+    if entry is None:
+        raise TTError(f"no active timer on order {order['order_id']}")
+    if entry["pause_started_at"]:
+        raise TTError(f"order {order['order_id']} is already paused")
+    _pause_entry(conn, entry, t)
+    touch(conn, order, t)
+    print(f"Paused {order['order_id']} [{entry['step']}] at {fmt_hmm(entry_seconds(entry, t))}")
+
+
+def cmd_resume(conn, args, t):
+    order = find_order(conn, args.order)
+    entry = open_entry(conn, order)
+    step = order["current_step"]
+    if entry is None:
+        _new_entry(conn, order, step, t)
+        word = "Started"
+    elif entry["pause_started_at"]:
+        _resume_entry(conn, entry, t)
+        word = "Resumed"
+    else:
+        raise TTError(f"order {order['order_id']} is already running")
+    touch(conn, order, t)
+    print(f"{word} {order['order_id']} [{step}]")
+
+
+def cmd_stop(conn, args, t):
+    if args.all:
+        if args.order:
+            raise TTError("give an order or --all, not both")
+        rows = _running_entries(conn, include_paused=True)
+        for entry in rows:
+            _close_entry(conn, entry, t)
+        names = ", ".join(r["order_id"] for r in rows)
+        print(f"Stopped {len(rows)} timer(s): {names}" if rows else "No active timers to stop")
+        return
+    order = find_order(conn, args.order)
+    entry = open_entry(conn, order)
+    if entry is None:
+        raise TTError(f"no active timer on order {order['order_id']}")
+    _close_entry(conn, entry, t)
+    touch(conn, order, t)
+    print(f"Stopped {order['order_id']} [{entry['step']}] at {fmt_hmm(entry_seconds(entry, t))}, "
+          f"order total {fmt_hmm(order_seconds(conn, order, t))} (still open)")
+
+
+def cmd_done(conn, args, t):
+    order = find_order(conn, args.order)
+    _complete_current_step(conn, order, t)
+    conn.execute("UPDATE orders SET status = 'done', closed_at = ?, touched_at = ? WHERE id = ?",
+                 (ts(t), ts(t), order["id"]))
+    print(f"Done: {order['order_id']} completed at step {order['current_step']}, "
+          f"total {fmt_hmm(order_seconds(conn, order, t))}")
+
+
+def _table(headers, rows):
+    widths = [max(len(str(x)) for x in col) for col in zip(headers, *rows)]
+    for row in [headers] + rows:
+        print("  ".join(str(x).ljust(w) for x, w in zip(row, widths)).rstrip())
+
+
+def cmd_status(conn, args, t):
+    orders = conn.execute("SELECT * FROM orders WHERE status = 'open' "
+                          "ORDER BY touched_seq DESC, id DESC").fetchall()
+    if not orders:
+        print("No open orders")
+        return
+    rows, running = [], 0
+    for i, order in enumerate(orders):
+        state = entry_state(open_entry(conn, order))
+        running += state == "running"
+        rows.append([("*" if i == 0 else " ") + order["order_id"], order["current_step"], state,
+                     fmt_hmm(order_seconds(conn, order, t, order["current_step"])),
+                     fmt_hmm(order_seconds(conn, order, t))])
+    _table([" ORDER", "STEP", "STATE", "STEP TIME", "TOTAL"], rows)
+    print(f"{len(orders)} open order(s), {running} running (* = most recent)")
+
+
+def cmd_show(conn, args, t):
+    order = find_order(conn, args.order, include_done=True)
+    entries = order_entries(conn, order)
+    state = "done" if order["status"] == "done" else entry_state(open_entry(conn, order))
+    print(f"Order {order['order_id']} ({state}, current step: {order['current_step']})")
+    steps = [s for s in STEPS if any(e["step"] == s for e in entries)]
+    steps += sorted({e["step"] for e in entries} - set(STEPS))
+    rows = []
+    for step in steps:
+        mine = [e for e in entries if e["step"] == step]
+        rows.append(["  " + step, fmt_hmm(sum(entry_seconds(e, t) for e in mine)),
+                     "complete" if any(e["step_completed"] for e in mine) else ""])
+    if rows:
+        _table(["  STEP", "TIME", ""], rows)
+    for e in entries:
+        if e["note"]:
+            print(f"  note [{e['step']} {e['start_ts'][:16]}]: {e['note']}")
+    print(f"Total for {order['order_id']}: {fmt_hmm(sum(entry_seconds(e, t) for e in entries))}")
+
+
+def _parse_date(text, flag):
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise TTError(f"invalid {flag} date '{text}'; use YYYY-MM-DD")
+
+
+def date_range(args, t, default_today):
+    """Return (first day, last day, label); either day may be None (unbounded)."""
+    custom = args.date_from or args.date_to
+    if sum([bool(args.today), bool(args.week), bool(custom)]) > 1:
+        raise TTError("use only one of --today, --week, or --from/--to")
+    today = t.date()
+    if args.week:
+        return today - timedelta(days=today.weekday()), today, "this week"
+    if custom:
+        first = _parse_date(args.date_from, "--from") if args.date_from else None
+        last = _parse_date(args.date_to, "--to") if args.date_to else None
+        if first and last and first > last:
+            raise TTError("--from date is after --to date")
+        return first, last, f"{first or 'start'} to {last or 'now'}"
+    if args.today or default_today:
+        return today, today, "today"
+    return None, None, "all time"
+
+
+def fetch_entries(conn, first, last):
+    """Entries whose start falls within [first, last] (dates, either may be None)."""
+    sql = ("SELECT e.*, o.order_id, o.status AS order_status FROM entries e "
+           "JOIN orders o ON o.id = e.order_pk WHERE 1 = 1")
+    params = []
+    if first:
+        sql += " AND e.start_ts >= ?"
+        params.append(f"{first} 00:00:00")
+    if last:
+        sql += " AND e.start_ts < ?"
+        params.append(f"{last + timedelta(days=1)} 00:00:00")
+    return conn.execute(sql + " ORDER BY e.start_ts, e.id", params).fetchall()
+
+
+def cmd_report(conn, args, t):
+    first, last, label = date_range(args, t, default_today=True)
+    entries = fetch_entries(conn, first, last)
+    if not entries:
+        print(f"No time recorded ({label})")
+        return
+    groups = {}
+    for e in entries:
+        groups.setdefault(e["order_id"], []).append(e)
+    rows, total = [], 0
+    for order_id, mine in groups.items():
+        secs = sum(entry_seconds(e, t) for e in mine)
+        total += secs
+        completed = {e["step"] for e in mine if e["step_completed"]}
+        ordered = [s for s in STEPS if s in completed] + sorted(completed - set(STEPS))
+        rows.append([order_id, mine[0]["order_status"], ", ".join(ordered) or "-", fmt_hmm(secs)])
+    _table(["ORDER", "STATUS", "STEPS COMPLETED", "TIME"], rows)
+    print(f"{len(rows)} order(s), total {fmt_hmm(total)} ({label})")
+
+
+def build_rows(entries, t):
+    """Turn entry rows into CSV row dicts (field -> text) per the CONFIG settings."""
+    if CSV_ROW_MODE == "entry":
+        key = lambda e: e["id"]
+    elif CSV_ROW_MODE == "step":
+        key = lambda e: (e["order_id"], e["step"])
+    elif CSV_ROW_MODE == "order":
+        key = lambda e: e["order_id"]
+    else:
+        raise TTError(f"CONFIG: unknown CSV_ROW_MODE '{CSV_ROW_MODE}' (use entry, step or order)")
+    groups = {}
+    for e in entries:
+        groups.setdefault(key(e), []).append(e)
+    rows = []
+    for mine in groups.values():
+        start = min(parse_ts(e["start_ts"]) for e in mine)
+        running = any(e["end_ts"] is None for e in mine)
+        end = None if running else max(parse_ts(e["end_ts"]) for e in mine)
+        steps = list(dict.fromkeys(e["step"] for e in mine))
+        steps.sort(key=lambda s: STEPS.index(s) if s in STEPS else len(STEPS))
+        notes = list(dict.fromkeys(e["note"] for e in mine if e["note"]))
+        rows.append({
+            "order_id": mine[0]["order_id"],
+            "step": ", ".join(steps),
+            "date": start.strftime(CSV_DATE_FORMAT),
+            "start": start.strftime(CSV_TIME_FORMAT),
+            "end": end.strftime(CSV_TIME_FORMAT) if end else "",
+            "duration": format_duration(sum(entry_seconds(e, t) for e in mine)),
+            "paused_time": format_duration(sum(entry_paused_seconds(e, t) for e in mine)),
+            "order_status": mine[0]["order_status"],
+            "note": "; ".join(notes),
+        })
+    return rows
+
+
+def write_csv(rows, handle):
+    unknown = [c for c in CSV_COLUMNS if c not in CSV_FIELDS]
+    if unknown:
+        raise TTError(f"CONFIG: unknown CSV_COLUMNS field(s): {', '.join(unknown)} "
+                      f"(choose from {', '.join(CSV_FIELDS)})")
+    writer = csv.writer(handle, delimiter=CSV_DELIMITER, lineterminator="\n")
+    if CSV_INCLUDE_HEADER:
+        writer.writerow([CSV_HEADERS.get(c, c) for c in CSV_COLUMNS])
+    for row in rows:
+        writer.writerow([row[c] for c in CSV_COLUMNS])
+
+
+def cmd_export(conn, args, t):
+    first, last, label = date_range(args, t, default_today=False)
+    rows = build_rows(fetch_entries(conn, first, last), t)
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as handle:
+            write_csv(rows, handle)
+        print(f"Exported {len(rows)} row(s) to {args.csv} ({label}, one row per {CSV_ROW_MODE})")
+    else:
+        write_csv(rows, sys.stdout)
+        # Keep stdout clean for piping; the confirmation goes to stderr.
+        print(f"Exported {len(rows)} row(s) ({label}, one row per {CSV_ROW_MODE})", file=sys.stderr)
+
+
+def cmd_note(conn, args, t):
+    text = " ".join(args.text).strip()
+    if not text:
+        raise TTError("note text is empty")
+    order = find_order(conn, args.order)
+    entry = open_entry(conn, order) or conn.execute(
+        "SELECT * FROM entries WHERE order_pk = ? ORDER BY start_ts DESC, id DESC LIMIT 1",
+        (order["id"],)).fetchone()
+    if entry is None:
+        raise TTError(f"order {order['order_id']} has no time entries to attach a note to")
+    combined = f"{entry['note']}; {text}" if entry["note"] else text
+    conn.execute("UPDATE entries SET note = ? WHERE id = ?", (combined, entry["id"]))
+    touch(conn, order, t)
+    print(f"Noted on {order['order_id']} [{entry['step']}]: {text}")
+
+
+def parse_time_arg(text, base_date):
+    """Parse 'HH:MM' (on base_date) or 'YYYY-MM-DD HH:MM'; seconds are optional."""
+    text = text.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.combine(base_date, datetime.strptime(text, fmt).time())
+        except ValueError:
+            pass
+    raise TTError(f"invalid time '{text}'; use HH:MM or 'YYYY-MM-DD HH:MM'")
+
+
+def _entry_line(e, t):
+    start = parse_ts(e["start_ts"])
+    if e["end_ts"]:
+        end = parse_ts(e["end_ts"])
+        end_text = end.strftime("%H:%M" if end.date() == start.date() else "%Y-%m-%d %H:%M")
+    else:
+        end_text = "paused" if e["pause_started_at"] else "running"
+    return [f"#{e['id']}", e["order_id"], e["step"], start.strftime("%Y-%m-%d %H:%M"),
+            end_text, fmt_hmm(entry_seconds(e, t)), e["note"] or ""]
+
+
+def cmd_edit(conn, args, t):
+    select = "SELECT e.*, o.order_id FROM entries e JOIN orders o ON o.id = e.order_pk "
+    if args.entry is None:
+        if args.start or args.end or args.delete:
+            raise TTError("give the entry number to edit, e.g. tt edit 12 --end 10:40")
+        entries = conn.execute(select + "ORDER BY e.start_ts DESC, e.id DESC LIMIT ?",
+                               (args.count,)).fetchall()
+        if not entries:
+            print("No entries to edit")
+            return
+        _table(["ENTRY", "ORDER", "STEP", "START", "END", "TIME", "NOTE"],
+               [_entry_line(e, t) for e in entries])
+        print(f"{len(entries)} most recent entries; change one with: "
+              "tt edit ENTRY [--start TIME] [--end TIME] [--delete]")
+        return
+
+    entry_id = args.entry.lstrip("#")
+    entry = conn.execute(select + "WHERE e.id = ?", (entry_id,)).fetchone() \
+        if entry_id.isdigit() else None
+    if entry is None:
+        raise TTError(f"no entry '{args.entry}'; run tt edit to list recent entries")
+    label = f"entry #{entry['id']} ({entry['order_id']} [{entry['step']}])"
+    if args.delete:
+        if args.start or args.end:
+            raise TTError("--delete cannot be combined with --start or --end")
+        conn.execute("DELETE FROM entries WHERE id = ?", (entry["id"],))
+        print(f"Deleted {label}, {fmt_hmm(entry_seconds(entry, t))}")
+        return
+    if not args.start and not args.end:
+        raise TTError("nothing to change; give --start, --end or --delete")
+
+    start = parse_ts(entry["start_ts"])
+    end = parse_ts(entry["end_ts"]) if entry["end_ts"] else None
+    paused = entry["paused_secs"]
+    pause_started = entry["pause_started_at"]
+    if args.start:
+        start = parse_time_arg(args.start, start.date())
+    if args.end:
+        end = parse_time_arg(args.end, (end or start).date())
+        if pause_started:  # closing a paused entry: count the pause up to the new end
+            paused += max(0, int((end - parse_ts(pause_started)).total_seconds()))
+            pause_started = None
+    limit = end or (parse_ts(pause_started) if pause_started else t)
+    if end and end > t:
+        raise TTError(f"end time {ts(end)} is in the future")
+    if start >= limit:
+        raise TTError(f"start {ts(start)} must be before "
+                      f"{'the end' if end else 'the pause' if pause_started else 'now'} {ts(limit)}")
+    if (limit - start).total_seconds() < paused:
+        raise TTError(f"that leaves less time than the entry's paused time ({fmt_hmm(paused)})")
+    conn.execute("UPDATE entries SET start_ts = ?, end_ts = ?, paused_secs = ?, "
+                 "pause_started_at = ? WHERE id = ?",
+                 (ts(start), ts(end) if end else None, paused, pause_started, entry["id"]))
+    updated = conn.execute("SELECT * FROM entries WHERE id = ?", (entry["id"],)).fetchone()
+    print(f"Updated {label}: {ts(start)[:16]} to {ts(end)[:16] if end else 'now'}, "
+          f"{fmt_hmm(entry_seconds(updated, t))}")
+
+
+# ----- command line ----------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="tt", description="Track time on work orders and their steps.",
+        epilog="ORDER may be any unique prefix or suffix of an open order's ID; "
+               "when omitted, the most recently touched order is used. "
+               f"Steps: {', '.join(f'{i}={s}' for i, s in enumerate(STEPS, 1))}.")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    def add(name, func, help_text):
+        p = sub.add_parser(name, help=help_text, description=help_text)
+        p.set_defaults(func=func)
+        return p
+
+    def add_range(p):
+        p.add_argument("--today", action="store_true", help="only today")
+        p.add_argument("--week", action="store_true", help="Monday of this week through today")
+        p.add_argument("--from", dest="date_from", metavar="DATE", help="first day, YYYY-MM-DD")
+        p.add_argument("--to", dest="date_to", metavar="DATE", help="last day, YYYY-MM-DD")
+
+    for name, func, text in (
+            ("start", cmd_start, "open the order if new and start its timer"),
+            ("switch", cmd_switch, "pause all other running timers and start or resume this one")):
+        p = add(name, func, text)
+        p.add_argument("order", nargs="?")
+        p.add_argument("step", nargs="?")
+        p.add_argument("--new", action="store_true",
+                       help="create a new order even if ORDER matches part of an open order's ID")
+
+    p = add("step", cmd_step, "move the order to a new step and mark the previous one complete")
+    p.add_argument("step")
+    p.add_argument("order", nargs="?")
+
+    p = add("pause", cmd_pause, "pause a running timer")
+    p.add_argument("order", nargs="?")
+    p.add_argument("--all", action="store_true", help="pause every running timer")
+
+    p = add("resume", cmd_resume, "resume a paused timer")
+    p.add_argument("order", nargs="?")
+
+    p = add("stop", cmd_stop, "stop the timer and leave the order open")
+    p.add_argument("order", nargs="?")
+    p.add_argument("--all", action="store_true", help="stop every active timer")
+
+    p = add("done", cmd_done, "stop the timer and mark the order complete")
+    p.add_argument("order", nargs="?")
+
+    add("status", cmd_status, "list open orders (also what a bare `tt` shows)")
+
+    p = add("show", cmd_show, "show time per step and the total for one order")
+    p.add_argument("order", nargs="?")
+
+    p = add("report", cmd_report, "table of orders with steps completed and total time (default: today)")
+    add_range(p)
+
+    p = add("export", cmd_export, "export as CSV using the CONFIG settings (default: all time)")
+    p.add_argument("--csv", metavar="FILE", help="write to FILE instead of standard output")
+    add_range(p)
+
+    p = add("note", cmd_note, "attach a note to the order's current entry")
+    p.add_argument("text", nargs="+")
+    p.add_argument("-o", "--order")
+
+    p = add("edit", cmd_edit, "list recent entries, or change or delete one")
+    p.add_argument("entry", nargs="?", help="entry number from the list")
+    p.add_argument("--start", metavar="TIME", help="new start: HH:MM or 'YYYY-MM-DD HH:MM'")
+    p.add_argument("--end", metavar="TIME", help="new end: HH:MM or 'YYYY-MM-DD HH:MM'")
+    p.add_argument("--delete", action="store_true", help="delete the entry")
+    p.add_argument("-n", dest="count", type=int, default=10, help="how many entries to list")
+    return parser
+
+
+def main(argv=None, conn=None):
+    args = build_parser().parse_args(argv)
+    func = getattr(args, "func", cmd_status)
+    own_conn = conn is None
+    try:
+        if own_conn:
+            conn = connect()
+        with conn:  # one transaction per command
+            func(conn, args, now())
+        return 0
+    except TTError as err:
+        print(f"tt: {err}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as err:
+        print(f"tt: database error: {err}", file=sys.stderr)
+        return 1
+    finally:
+        if own_conn and conn is not None:
+            conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
